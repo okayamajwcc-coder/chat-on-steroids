@@ -456,12 +456,23 @@ public static class Clf {
     if (IsIconic(h)) ShowWindow(h, 9);
     uint dummy;
     uint fore = GetWindowThreadProcessId(GetForegroundWindow(), out dummy);
+    uint target = GetWindowThreadProcessId(h, out dummy);
     uint self = GetCurrentThreadId();
-    bool attached = fore != 0 && fore != self && AttachThreadInput(self, fore, true);
+    var attached = new List<Tuple<uint, uint>>();
+    Action<uint, uint> attach = (from, to) => {
+      if (from == 0 || to == 0 || from == to) return;
+      foreach (var pair in attached)
+        if ((pair.Item1 == from && pair.Item2 == to) || (pair.Item1 == to && pair.Item2 == from)) return;
+      if (AttachThreadInput(from, to, true)) attached.Add(Tuple.Create(from, to));
+    };
+    attach(self, fore);
+    attach(self, target);
+    attach(fore, target);
     try {
       return SetForegroundWindow(h);
     } finally {
-      if (attached) AttachThreadInput(self, fore, false);
+      for (int i = attached.Count - 1; i >= 0; i--)
+        AttachThreadInput(attached[i].Item1, attached[i].Item2, false);
     }
   }
 
