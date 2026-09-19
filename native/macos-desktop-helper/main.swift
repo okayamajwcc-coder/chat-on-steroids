@@ -197,8 +197,8 @@ private func offscreenAXWindowStates(in rows: [WindowRow]) -> [CGWindowID: Bool]
         for window in windows {
             if ProcessInfo.processInfo.systemUptime >= deadline { break pidLoop }
             let id: CGWindowID?
-            if let exact = axWindowNumber(window), rows.contains(where: { $0.id == exact && $0.pid == pid }) {
-                id = exact
+            if let exact = axWindowNumber(window) {
+                id = rows.contains(where: { $0.id == exact && $0.pid == pid }) ? exact : nil
             } else if let bounds = axBounds(window) {
                 id = unambiguousWindowID(bounds: bounds, pid: pid, rows: rows)
             } else {
@@ -485,7 +485,6 @@ private func windowServerTopWindowID(at point: CGPoint) -> CGWindowID? {
     ) as? [JSONObject] else { return nil }
     for item in ordered {
         guard let id = number(item[kCGWindowNumber as String])?.uint32Value,
-              int(item[kCGWindowLayer as String]) == 0,
               let boundsDictionary = item[kCGWindowBounds as String] as? NSDictionary,
               let bounds = CGRect(dictionaryRepresentation: boundsDictionary),
               bounds.contains(point),
@@ -571,7 +570,10 @@ private func matchingAXWindow(_ row: WindowRow, deadline suppliedDeadline: TimeI
         axElementAttribute(app, kAXFocusedWindowAttribute as CFString),
         axElementAttribute(app, kAXMainWindowAttribute as CFString)
     ].compactMap({ $0 }) {
-        if axWindowNumber(preferred) == row.id { return preferred }
+        if let exact = axWindowNumber(preferred) {
+            if exact == row.id { return preferred }
+            continue
+        }
         if let bounds = axBounds(preferred),
            convincinglyMatchesWindow(bounds, row.bounds),
            unambiguousWindowID(bounds: bounds, pid: row.pid, rows: allWindowRows(includeMinimized: true)) == row.id {
@@ -583,7 +585,7 @@ private func matchingAXWindow(_ row: WindowRow, deadline suppliedDeadline: TimeI
         guard ProcessInfo.processInfo.systemUptime < deadline else {
             throw fail("UIA_TIMEOUT", "accessibility window matching exceeded its bounded native deadline")
         }
-        guard let bounds = axBounds(window), convincinglyMatchesWindow(bounds, row.bounds) else { continue }
+        guard axWindowNumber(window) == nil, let bounds = axBounds(window), convincinglyMatchesWindow(bounds, row.bounds) else { continue }
         geometryCandidates.append((window, windowGeometryDistance(bounds, row.bounds)))
     }
     geometryCandidates.sort { $0.distance < $1.distance }

@@ -38,6 +38,20 @@ describe('macOS desktop safety hardening', () => {
     expect(swift).toMatch(/private func pointerTargetMatches[\s\S]*windowServerFrontWindowID\(rows: rows\) == row\.id/);
   });
 
+  it('rejects contradictory positive AX ids before geometry fallback', () => {
+    expect(swift).toContain('id = rows.contains(where: { $0.id == exact && $0.pid == pid }) ? exact : nil');
+    expect(swift).toMatch(/if let exact = axWindowNumber\(preferred\)[\s\S]*if exact == row\.id[\s\S]*continue/);
+    expect(swift).toContain('guard axWindowNumber(window) == nil, let bounds = axBounds(window)');
+  });
+
+  it('includes floating windows in point occlusion proof', () => {
+    const start = swift.indexOf('private func windowServerTopWindowID');
+    const end = swift.indexOf('private func pointerTargetMatches');
+    const proof = swift.slice(start, end);
+    expect(proof).not.toContain('int(item[kCGWindowLayer as String]) == 0');
+    expect(proof).toContain('bounds.contains(point)');
+  });
+
   it('allows only AX-proven off-Space frames to activate before requiring on-screen pointer proof', () => {
     expect(swift).toMatch(/private func validateFrame[\s\S]*guard let row = windowRow\(windowID\)[\s\S]*focusWindow\(windowID\)[\s\S]*after\.onScreen[\s\S]*assertFrameTarget\(frame\)/);
     expect(swift).toMatch(/private func assertFrameTarget[\s\S]*guard let row = windowRow\(windowID\), row\.onScreen/);
