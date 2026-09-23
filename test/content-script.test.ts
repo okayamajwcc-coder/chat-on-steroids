@@ -177,6 +177,8 @@ interface Harness {
   runtimeMessage(message: Record<string, any>): Promise<unknown>;
   /** Browser-extension listeners still owned by live recorder instances in this document. */
   listenerCounts(): { runtime: number; storage: number };
+  /** Invoke document capture listeners with native trust; jsdom only dispatches synthetic clicks. */
+  trustedClick(target: Element): void;
   /** Moves the clock the script reads. Nothing else advances it between ticks. */
   advance(ms: number): void;
   close(): void;
@@ -221,6 +223,17 @@ async function harness(
   });
 
   const sent: Array<Record<string, any>> = [];
+  const clickListeners = new Set<EventListener>();
+  const addDocumentListener = window.document.addEventListener.bind(window.document);
+  const removeDocumentListener = window.document.removeEventListener.bind(window.document);
+  window.document.addEventListener = ((type: string, listener: EventListener, options: any) => {
+    if (type === 'click' && options === true) clickListeners.add(listener);
+    addDocumentListener(type, listener, options);
+  }) as typeof window.document.addEventListener;
+  window.document.removeEventListener = ((type: string, listener: EventListener, options: any) => {
+    if (type === 'click' && options === true) clickListeners.delete(listener);
+    removeDocumentListener(type, listener, options);
+  }) as typeof window.document.removeEventListener;
   const reply = new Map<string, (message: Record<string, any>) => unknown>();
   type RuntimeListener = (
     message: Record<string, any>,
@@ -379,6 +392,12 @@ async function harness(
         if (async !== true && !answered) resolve(undefined);
       }),
     listenerCounts: () => ({ runtime: runtimeListeners.size, storage: storageListeners.size }),
+    trustedClick: target => {
+      const click = new window.MouseEvent('click', { bubbles: true });
+      const event = new Proxy(click, { get: (value, key) => key === 'isTrusted' ? true : key === 'target' ? target :
+        typeof Reflect.get(value, key, value) === 'function' ? Reflect.get(value, key, value).bind(value) : Reflect.get(value, key, value) });
+      for (const listener of clickListeners) listener.call(window.document, event);
+    },
     advance,
     close: () => dom.window.close()
   };
@@ -782,6 +801,53 @@ describe('desktop input delivery and helper ownership', () => {
     expect(live.document.querySelector('#prompt-textarea')!.textContent).toBe(change === 'untouched' || change === 'delayed-raw' ? '' : change === 'edited' ? 'My independent draft' : text);
   });
 
+  it.each(['contenteditable', 'aria-disabled'].flatMap(attribute => ['loading', 'model-change'].map(phase => ({ attribute, phase }))))(
+    'waits for the visible helper editor to become writable ($attribute, $phase)', async ({ attribute, phase }) => {
+    live = await harness(`https://chatgpt.com/?temporary-chat=true&cos-input=${inputId}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail
+        ? { ok: true } : { input: claimed({ purpose: 'decision', lifetime: 'temporary-planner' }) } })
+    });
+    const toggle = live.document.createElement('button'); toggle.setAttribute('aria-label', 'Temporary chat');
+    toggle.innerHTML = '<svg><use href="/sprite.svg#chat-temp-checked"></use></svg>';
+    Object.defineProperty(toggle, 'getClientRects', { value: () => [{}] }); live.document.body.append(toggle);
+    const box = live.document.querySelector('#prompt-textarea')!;
+    const disable = () => box.setAttribute(attribute, attribute === 'contenteditable' ? 'false' : 'true');
+    if (phase === 'loading') disable();
+    else (live.window as any).CLF_DOM.selectModelSettings = async () => { disable(); return true; };
+    const instantTimer = live.window.setTimeout;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => ms === 15000 ? 0 : instantTimer(fn, ms)) as typeof live.window.setTimeout;
+    const edit = vi.spyOn(live.document, 'execCommand');
+    const send = vi.fn(() => {
+      userTurn(live!.document, 'ready-helper-user', text);
+      box.textContent = '';
+    });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', send);
+    const accepting = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null });
+    await settle(80);
+    expect(live.sent.filter(message => message.fail)).toEqual([]);
+    expect(live.sent.filter(message => message.type === 'desktop_input')).toHaveLength(phase === 'loading' ? 0 : 1);
+    expect(edit).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    box.setAttribute(attribute, attribute === 'contenteditable' ? 'true' : 'false');
+    expect(await accepting).toEqual({ ok: true });
+    expect(edit.mock.calls.filter(([command]) => command === 'insertHTML')).toHaveLength(1);
+    expect(send).toHaveBeenCalledOnce();
+    expect(live.sent.filter(message => message.fail)).toEqual([]);
+    expect(live.sent.filter(message => message.ack)).toHaveLength(1);
+  });
+
+  it('retains the insertion predicate when the helper editor rejects native editing', async () => {
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      desktop_input: message => ({ ok: true, data: message.fail ? { ok: true } : { input: claimed({ purpose: 'decision' }) } })
+    });
+    live.document.execCommand = vi.fn(() => false);
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: false });
+    expect(live.sent.filter(message => message.fail)).toEqual([expect.objectContaining({
+      id: inputId, owner: 'input-owner', error: 'ChatGPT did not accept the text (native_edit_rejected)'
+    })]);
+    expect(live.sent.some(message => message.authorize || message.ack)).toBe(false);
+  });
+
   it('retains the temporary decision when composer acceptance precedes the mounted user receipt', async () => {
     const canonical = '{"action":"continue","reply":"late mounted plan"}';
     live = await harness(`https://chatgpt.com/?temporary-chat=true&cos-input=${inputId}`, {
@@ -882,6 +948,29 @@ describe('desktop input delivery and helper ownership', () => {
     expect(live.sent.filter(message => message.type === 'desktop_input' && message.ack)).toEqual([
       expect.objectContaining({ id: inputId, owner: 'input-owner', conversationId: chatA, ack: true })
     ]);
+  });
+
+  it.each([false, true])('carries a reserved opening into route binding before activity (project: %s)', async project => {
+    live = await harness(`https://chatgpt.com/?cos-input=${inputId}`, {
+      events: () => ({ ok: false }),
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack
+        ? { ok: true } : { input: claimed({ opening: true, projectId: project ? inputId : null }) } }),
+      bind: message => ({ ok: true, bound: 0, projectBound: message.projectInput?.id })
+    });
+    const send = vi.fn(() => {
+      live!.dom.reconfigure({ url: `https://chatgpt.com/c/${chatA}` });
+      userTurn(live!.document, 'bound-opening-user', text);
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+      live!.hook.observe();
+    });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', send);
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: null })).toEqual({ ok: true });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(live.sent.filter(message => message.type === 'bind')).toContainEqual(expect.objectContaining({
+      conversationId: chatA, projectInput: { id: inputId, owner: 'input-owner' }
+    }));
+    expect(live.hook.desktopProjectInputForTest()).toBeNull();
+    expect(live.sent.filter(message => message.ack)).toHaveLength(1);
   });
 
   it('carries the exact pending opening into first-call correlation and retires only its accepted claim', async () => {
@@ -1907,7 +1996,7 @@ async function replyFiber(
     );
     window.dispatchEvent(
       new window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 12, scanOk: true, rows, turns: indexedTurns },
+        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 21, scanOk: true, rows, turns: indexedTurns },
         source: window
       })
     );
@@ -3583,7 +3672,7 @@ describe('the app-owned chronological stream', () => {
         section.querySelector(`[data-message-id="${id}"] .markdown`)?.setAttribute('data-clf-fiber-message', `${scanToken}:0:${id}`);
       }
       live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 12, scanOk: true, rows: [], turns: [{
+        data: { source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21, scanOk: true, rows: [], turns: [{
           index: 0, turnId: 'idle-history-page', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
           calls: [{ messageId: 'idle-history-tool', requestId, tool: 'exec_command', order: 0, answered: true }],
           messages: [
@@ -3640,7 +3729,7 @@ describe('the app-owned chronological stream', () => {
       const scanToken = event.data.nonce;
       section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
       live!.window.dispatchEvent(new live!.window.MessageEvent('message', { source: live!.window as unknown as Window, data: {
-        source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 12, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21, scanOk: true, rows: [], turns: [{
           index: 0, turnId: 'idle-resume-answer', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
           calls: [], activities: [], endMessageId: 'idle-resume-final-raw', messages: [
             { role: 'user', messageId: 'idle-resume-user', rawMessageId: 'idle-resume-user-raw', stable: true,
@@ -3847,7 +3936,7 @@ describe('the app-owned chronological stream', () => {
       ({ messageId, rawMessageId: messageId, stable: true, rawText, renderedHtml: '' }));
     section.setAttribute('data-clf-fiber-turn', '0');
     await replyFiber([{
-      v: 12, index: 0, messageId: 'interim-native-X', tool: 'read', app: 'Chat On Steroids Core', answered: true,
+      v: 21, index: 0, messageId: 'interim-native-X', tool: 'read', app: 'Chat On Steroids Core', answered: true,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     }], [{ turnId: 'interrupted-fold-page', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', messages,
       calls: [{ messageId: 'interim-native-X', requestId, tool: 'read', order: 0, answered: true }], activities: [],
@@ -4006,7 +4095,8 @@ describe('the app-owned chronological stream', () => {
     expect(section.querySelectorAll('[data-clf-native-hidden]')).toHaveLength(0);
   });
 
-  it.each(['owned', 'no-local-call', 'foreign-owner'])('hides plain native status captions for the current native response without requiring local calls (%s)', async mode => {
+  it.each(['owned', 'no-local-call', 'foreign-owner'].flatMap(mode =>
+    ['legacy', 'v5', 'v5-empty', 'v5-long'].map(shape => ({ mode, shape }))))('hides plain native status captions for the current native response without requiring local calls ($mode, $shape)', async ({ mode, shape }) => {
     const requestId = 'wfr-plain-native-caption';
     live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: [
       { seq: 1, time: 100, kind: 'turn_start', turnId: 'plain-caption-owner' },
@@ -4017,9 +4107,10 @@ describe('the app-owned chronological stream', () => {
     renderingOn();
     const section = assistantTurn(live.document, 'plain-caption-page', []);
     const layout = live.document.createElement('div');
-    const caption = live.document.createElement('span');
-    caption.className = 'group/tool-message';
-    caption.textContent = 'Inspected repository guidance and investigated failures';
+    const caption = live.document.createElement(shape === 'legacy' ? 'span' : 'div');
+    if (shape === 'legacy') caption.className = 'group/tool-message';
+    else caption.innerHTML = '<span data-testid="cot-v5-tool-icon-pile"><span data-testid="cot-v5-native-tool-icon"><svg></svg></span></span>';
+    caption.append(shape === 'v5-empty' ? '' : 'Inspected repository guidance and investigated failures'.repeat(shape === 'v5-long' ? 5 : 1));
     const action = live.document.createElement('button');
     action.setAttribute('aria-label', 'Open native result');
     action.innerHTML = '<svg aria-hidden="true"></svg>';
@@ -4129,7 +4220,7 @@ describe('the app-owned chronological stream', () => {
         section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
         row.setAttribute('data-clf-fiber-thought', `${scanToken}:0:${thoughtId}`);
         answer = () => window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 12, scanOk: true, rows: [],
+          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21, scanOk: true, rows: [],
           turns: [{ index: 0, turnId: 'pending-stamp-answer', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
             calls: [], messages: [], thoughtNotifications: [{ messageId: thoughtId, kind: 'thought_notification' }] }]
         } }));
@@ -5195,9 +5286,9 @@ describe('the app-owned chronological stream', () => {
     blocks[0]!.setAttribute('data-clf-fiber', '0');
     blocks[1]!.setAttribute('data-clf-fiber', '1');
     const rows = (secondAnswered: boolean) => [
-      { v: 12, index: 0, messageId: 'fiber-one', tool: 'read_file', path: '/Chat On Steroids Core/read_file',
+      { v: 21, index: 0, messageId: 'fiber-one', tool: 'read_file', path: '/Chat On Steroids Core/read_file',
         app: 'Chat On Steroids Core', answered: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' },
-      { v: 12, index: 1, messageId: 'fiber-two', tool: 'exec_command', path: '/Chat On Steroids Core/exec_command',
+      { v: 21, index: 1, messageId: 'fiber-two', tool: 'exec_command', path: '/Chat On Steroids Core/exec_command',
         app: 'Chat On Steroids Core', answered: secondAnswered, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
     ];
     const turn = (secondAnswered: boolean) => ({
@@ -5237,7 +5328,7 @@ describe('the app-owned chronological stream', () => {
     userTurn(live.document, 'exact-block-owner', 'Read the exact file', { sent: false });
     const section = assistantTurn(live.document, 'exact-block-page', ['Native connector row']);
     const block = blocksOf(section)[0]!; section.setAttribute('data-clf-fiber-turn', '0'); block.setAttribute('data-clf-fiber', '0');
-    await replyFiber([{ v: 12, index: 0, messageId: 'fiber-exact-block', tool: 'read_file',
+    await replyFiber([{ v: 21, index: 0, messageId: 'fiber-exact-block', tool: 'read_file',
       path: `/${app}/read_file`, app, answered: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }], [{
       turnId: 'exact-block-page', calls: [{ messageId: 'fiber-exact-block', tool: 'read_file', order: 0,
         answered: true, requestId: 'wfr-exact-block' }]
@@ -5263,7 +5354,7 @@ describe('the app-owned chronological stream', () => {
     const blocks = blocksOf(section); section.setAttribute('data-clf-fiber-turn', '0');
     blocks.forEach((block, index) => block.setAttribute('data-clf-fiber', String(index)));
     const calls = ['read', secondTool].map((tool, index) => ({ messageId: `result-provider-${index}`, tool, order: index, requestId, answered: true }));
-    await replyFiber(calls.map((call, index) => ({ v: 12, index, ...call, path: null,
+    await replyFiber(calls.map((call, index) => ({ v: 21, index, ...call, path: null,
       app: 'Chat On Steroids Core', resource: `/asdk_app_fixture/link_fixture/${call.tool}`,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' })), [{ turnId: 'result-only-page', calls }]);
     await live.hook.pullActivity(); live.hook.renderStreams();
@@ -6209,7 +6300,7 @@ describe('the app-owned chronological stream', () => {
     section.setAttribute('data-clf-fiber-turn', '0');
     block.setAttribute('data-clf-fiber', '0');
     const bind = async (answered: boolean) => replyFiber([{
-      v: 12, index: 0, messageId: 'fiber-moved-call', tool: 'read_file',
+      v: 21, index: 0, messageId: 'fiber-moved-call', tool: 'read_file',
       path: '/Chat On Steroids Core/read_file', app: 'Chat On Steroids Core', answered,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     }], [{ turnId, calls: [{ messageId: 'fiber-moved-call', tool: 'read_file', order: 0,
@@ -7354,7 +7445,7 @@ describe('a stop button that goes missing while the turn is still running', () =
           source: 'clf-fiber-reply',
           nonce: event.data.nonce,
           scanToken: event.data.nonce,
-          v: 12,
+          v: 21,
           scanOk: true,
           rows: [],
           turns: [{
@@ -7634,7 +7725,7 @@ describe('a stop button that goes missing while the turn is still running', () =
    * the tab. That strands exactly the frozen turn the reload exists to heal, which is the same
    * mistake as calling a repair done because it was handed out.
    */
-  /** A turn the user stopped is finished, however long the page then sits there. */
+  /** Native Stop intent vetoes automatic browser input even before the page obeys it. */
   it('never reloads a stalled turn the user stopped', async () => {
     live = await harness(undefined, { reload_owned_chat: () => ({ ok: true }) });
     userTurn(live.document, 'turn-stopped-user', 'do the long thing');
@@ -7644,7 +7735,7 @@ describe('a stop button that goes missing while the turn is still running', () =
     await settle();
 
     const stop = live.document.querySelector('[data-testid="stop-button"]')!;
-    stop.dispatchEvent(new live.window.MouseEvent('click', { bubbles: true }));
+    live.trustedClick(stop);
 
     live.advance(live.hook.STALL_MS + 1);
     live.hook.observe();
@@ -8026,10 +8117,10 @@ describe('a stop button that goes missing while the turn is still running', () =
   });
 
   /**
-   * The user pressing stop is not a signal that needs corroborating, and a composer that
-   * stays disabled for four more seconds because the app is being careful is its own bug.
+   * A trusted Stop request is distinct from a synthetic click. Once the native
+   * page also becomes idle, its stopped observation can close the local view.
    */
-  it('closes at once when the user stopped the turn', async () => {
+  it('records a stopped view after a trusted Stop request and native generation ends', async () => {
     live = await harness();
     startGenerating(live.document);
     assistantTurn(live.document, 'turn-stopped', ['partial answer before stop']);
@@ -8037,7 +8128,9 @@ describe('a stop button that goes missing while the turn is still running', () =
     await settle();
 
     const stop = live.document.querySelector('[data-testid="stop-button"]')!;
-    stop.dispatchEvent(new live.window.MouseEvent('click', { bubbles: true }));
+    live.trustedClick(stop);
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
     stopGenerating(live.document);
     live.hook.observe();
     await settle();
@@ -8198,6 +8291,109 @@ describe('a content script reloaded into a turn already in flight', () => {
     const order = live.sent.map((message) => message.type);
     expect(order.indexOf('bind')).toBeGreaterThanOrEqual(0);
     expect(order.indexOf('bind')).toBeLessThan(order.indexOf('events'));
+  });
+
+  it.each([true, false])('binds a separate final section only within the exact adopted question (same question: %s)', async sameQuestion => {
+    const source = 'g-split-final-source';
+    live = await harness(undefined, {
+      activity: () => activity({ activeTurnId: source, recordedTurnId: source,
+        recordedQuestionId: 'm-turn-live-user',
+        userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-turn-live-user' }] })
+    }, midTurn);
+    live.hook.observe(); await settle();
+    const interim = live.document.querySelector<HTMLElement>('[data-turn-id="turn-live"]')!;
+    const partial = { turnId: 'turn-live', messages: [{ messageId: 'split-interim', rawMessageId: 'split-interim',
+      stable: true, rawText: 'Checking the implementation.', renderedHtml: '' }] };
+    await bindFiberTurns([{ section: interim, turn: partial }]);
+
+    if (!sameQuestion) userTurn(live.document, 'different-question', 'Answer a new question.');
+    const final = assistantTurn(live.document, 'separate-final-section', []);
+    prose(live.document, final, 'split-terminal', 'The requested work is complete.');
+    stopGenerating(live.document);
+    if (sameQuestion) { live.hook.observe(); await settle(); }
+    await bindFiberTurns([{ section: interim, turn: partial }, { section: final, turn: {
+      turnId: 'separate-final-section', endMessageId: 'split-terminal',
+      messages: [{ messageId: 'split-terminal', rawMessageId: 'split-terminal', stable: true,
+        rawText: 'The requested work is complete.', renderedHtml: '' }]
+    } }]);
+    await live.hook.flush();
+    const answer = emitted(live.sent, 'assistant_message').at(-1)?.event;
+    expect(answer).toMatchObject({
+      providerMessageId: 'split-terminal', final: true
+    });
+    if (sameQuestion) {
+      expect(answer?.turnId).toBe(source);
+      expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+        expect.objectContaining({ turnId: source, outcome: 'completed' })
+      ]);
+      expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    } else {
+      const next = emitted(live.sent, 'turn_start').at(-1)?.event.turnId;
+      expect(next).toBeTypeOf('string');
+      expect(next).not.toBe(source);
+      expect(answer?.turnId).toBe(next);
+    }
+  });
+
+  it.each(['empty', 'refused'])('adopts exact recorded ownership arriving after an initially %s activity response', async initial => {
+    const source = 'g-late-adopted-final';
+    live = await harness(undefined, {
+      activity: () => initial === 'refused' ? { ok: false, error: 'no_such_session' }
+        : activity({ activeTurnId: null, recordedTurnId: null,
+          userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-late-question' }] })
+    }, document => {
+      userTurn(document, 'late-question', 'Complete this task.', { sent: false });
+      const final = assistantTurn(document, 'late-final-section', []);
+      prose(document, final, 'late-terminal', 'The work is complete.');
+    });
+    const final = live.document.querySelector<HTMLElement>('[data-turn-id="late-final-section"]')!;
+    const terminal = { turnId: 'late-final-section', endMessageId: 'late-terminal', messages: [{
+      messageId: 'late-terminal', rawMessageId: 'late-terminal', stable: true,
+      rawText: 'The work is complete.', renderedHtml: ''
+    }] };
+    await bindFiberTurns([{ section: final, turn: terminal }]); await live.hook.flush();
+    live.reply.set('activity', () => activity({ activeTurnId: null, recordedTurnId: source,
+      recordedQuestionId: 'm-late-question',
+      userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-late-question' }] }));
+    await live.hook.pullActivity();
+    await bindFiberTurns([{ section: final, turn: terminal }]); await live.hook.flush();
+    expect(emitted(live.sent, 'assistant_message').at(-1)?.event).toMatchObject({ turnId: source, final: true });
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: source, outcome: 'completed' })
+    ]);
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    expect(composerText(live.document)).toBe('');
+    // A stale activity reply after this document closed the turn cannot adopt it again.
+    await live.hook.pullActivity();
+    await bindFiberTurns([{ section: final, turn: terminal }]); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(1);
+    expect((await live.runtimeMessage({ type: 'clf-page-status' }) as any).generating).toBe(false);
+  });
+
+  it.each(['missing', 'different', 'stopped'])('refuses late adoption without a current eligible question (%s)', async variant => {
+    live = await harness(undefined, {
+      activity: () => activity({ activeTurnId: null, recordedTurnId: null })
+    }, document => {
+      userTurn(document, 'current-question', 'The current task.', { sent: false });
+      assistantTurn(document, 'current-answer', []);
+      if (variant === 'stopped') startGenerating(document, { send: false });
+    });
+    if (variant === 'stopped') {
+      live.trustedClick(live.document.querySelector('[data-testid="stop-button"]')!);
+      stopGenerating(live.document);
+    }
+    live.reply.set('activity', () => activity({ activeTurnId: 'g-unproven-old-turn',
+      recordedTurnId: 'g-unproven-old-turn',
+      recordedQuestionId: variant === 'missing' ? null : variant === 'different' ? 'm-other-question' : 'm-current-question' }));
+    await live.hook.pullActivity();
+    const final = live.document.querySelector<HTMLElement>('[data-turn-id="current-answer"]')!;
+    await bindFiberTurns([{ section: final, turn: { turnId: 'current-answer', endMessageId: 'unowned-terminal',
+      messages: [{ messageId: 'unowned-terminal', rawMessageId: 'unowned-terminal', stable: true,
+        rawText: 'Historical answer.', renderedHtml: '' }] } }]);
+    await live.hook.flush();
+    expect(emitted(live.sent, 'assistant_message').at(-1)?.event.turnId).toBeUndefined();
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
   });
 
   it('waits for the existing response identity when New Chat navigates to a running chat', async () => {
@@ -9527,7 +9723,7 @@ describe('a page leaving the screen', () => {
  */
 describe('evidence from the page context', () => {
   const GOOD = {
-    v: 12,
+    v: 21,
     index: 0,
     tool: 'agent_status',
     path: '/TobisComputer/mcp/agent_status',
@@ -10650,7 +10846,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 12,
+            v: 21,
             scanOk: true,
             rows: [],
             turns: [
@@ -10757,7 +10953,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 12,
+            v: 21,
             scanOk: true,
             rows: [{ ...GOOD, tool: 'read' }],
             turns: []
@@ -11235,6 +11431,25 @@ describe('the Compact & resume control', () => {
 
     live.hook.closeMenu();
     expect((live.document.querySelector('.clf-menu') as HTMLElement).hidden).toBe(true);
+  });
+
+  it.each(['goal', 'loop'] as const)('offers the current %s delivery choice only while finish is available', async mode => {
+    let finishAvailable = true;
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0,
+        goal: { enabled: true, own: true, mode, hasKey: true, draft: null,
+          proLoopDelivery: finishAvailable, afterTurn: false } } })
+    });
+    await live.hook.pullActivity();
+    live.hook.injectControl(); live.hook.toggleMenu();
+    const timing = () => [...live!.document.querySelectorAll<HTMLButtonElement>('.clf-menu-action')]
+      .find(button => button.textContent?.includes('Only finish'));
+    expect(timing()?.textContent).toBe(`${mode === 'goal' ? 'Goal' : 'Loop'}: Only finish`);
+    timing()!.click(); await settle();
+    expect(live.sent.filter(message => message.type === 'settings_set').at(-1)).toMatchObject({ loopAfterTurn: true });
+    finishAvailable = false;
+    await live.hook.pullActivity();
+    expect(timing()).toBeUndefined();
   });
 
   it('locks every compaction affordance in a worker chat and emits no settings write when clicked', async () => {
@@ -11964,6 +12179,63 @@ describe('the Compact & resume control', () => {
     expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('message box is not ready (composer_missing)');
   });
 
+  it.each([false, true])('establishes the compaction source after hydration (editor already mounted=%s)', async editorMounted => {
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null,
+        recordedQuestionId: 'm-restored-question' } }),
+      compact: () => ({ ok: true, data: { started: true, token: 'hydrated-source', prompt: 'Write the exact handoff brief.',
+        job: { sessionId: 'hydrated-session', stage: 'handoff-pending', automatic: true, busy: true, handoffId: null, error: null } } })
+    });
+    live.hook.injectControl();
+    const box = live.document.querySelector('#prompt-textarea')!;
+    const parent = box.parentNode!;
+    if (!editorMounted) box.remove();
+    const timer = live.window.setTimeout;
+    let waiting = false;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 15000) { waiting = true; return 0; }
+      return timer(fn, ms);
+    }) as typeof timer;
+    const sends = watchSend(live.document);
+    const running = live.hook.startCompact(true);
+    await settle(100);
+    expect(waiting).toBe(true);
+    expect(sends()).toBe(0);
+    userTurn(live.document, 'restored-question', 'Existing work to continue', { sent: false });
+    if (!editorMounted) parent.appendChild(box);
+    await running;
+    expect(sends()).toBe(1);
+    expect(live.sent.filter(message => message.sourceDispatch)).toHaveLength(1);
+    expect(live.sent.some(message => message.sourceLost)).toBe(false);
+  });
+
+  it.each(['question', 'send', 'navigation'] as const)('does not compact after a real %s change during source hydration', async change => {
+    live = await harness(undefined, {
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
+      compact: message => message.sourceLost ? { ok: true, data: { aborted: true, job: null } }
+        : { ok: true, data: { started: true, token: 'changed-source', prompt: 'Write the exact handoff brief.',
+          job: { sessionId: 'changed-session', stage: 'handoff-pending', automatic: true, busy: true, handoffId: null, error: null } } }
+    });
+    live.hook.injectControl();
+    if (change === 'question') userTurn(live.document, 'original', 'Original work', { sent: false });
+    const box = live.document.querySelector('#prompt-textarea')!;
+    const parent = box.parentNode!;
+    box.remove();
+    const timer = live.window.setTimeout;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => ms === 15000 ? 0 : timer(fn, ms)) as typeof timer;
+    const sends = watchSend(live.document);
+    const running = live.hook.startCompact(true);
+    await settle(100);
+    parent.appendChild(box);
+    if (change === 'question') userTurn(live.document, 'replacement', 'New work', { sent: false });
+    if (change === 'send') userTurn(live.document, 'new-send', 'New work');
+    if (change === 'navigation') live.window.history.pushState({}, '', '/c/bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee');
+    await running;
+    expect(sends()).toBe(0);
+    expect(live.sent.some(message => message.sourceAttempt || message.sourceDispatch || message.resume)).toBe(false);
+    expect(composerText(live.document)).toBe('');
+  });
+
   it.each(['missing', 'disabled', 'hidden'] as const)('waits for a %s editor to become available before inserting one handoff', async state => {
     live = await harness(undefined, {
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
@@ -12625,7 +12897,11 @@ describe('truthful quiet operation status', () => {
     const view = (workers: unknown) => live!.hook.stageView({ now: 10000, changedAt: 0, progress: { workers } });
     expect(view({ active: 1, finished: 2, failed: 0, names: ['Repository audit'] })).toMatchObject({ stage: 'Worker still running: Repository audit', detail: '2 finished · 1 running' });
     expect(view({ active: 2, finished: 1, failed: 1 })).toMatchObject({ stage: '2 workers still running', detail: '1 finished · 2 running · 1 failed' });
-    expect(view({ active: 0, finished: 2, failed: 1 })).toMatchObject({ stage: 'A worker needs attention' });
+    expect(view({ active: 0, finished: 2, failed: 1 })).toBeNull();
+    expect(live.hook.stageView({ now: 10000, changedAt: 0, generating: true,
+      progress: { workers: { active: 0, finished: 2, failed: 1 } } })).toMatchObject({
+      stage: 'Still waiting for the current operation to complete'
+    });
     expect(view({ active: 0, finished: 3, failed: 0 })).toBeNull(); // no invented consolidation
   });
   it('waits through short pauses and clears the status when real output resumes', async () => {
@@ -14028,7 +14304,8 @@ describe('the fresh chat the app opened', () => {
     expect(live.document.querySelector('#prompt-textarea')!.textContent).toBe('');
   });
 
-  it('overwrites a New Chat autosaved draft and sends the worker bootstrap once', async () => {
+  it.each([false, true])('overwrites a New Chat autosaved draft once and requires its worker receipt (received=%s)', async received => {
+    let sends = 0;
     live = await harness(
       'https://chatgpt.com/?clf=cmd-9',
       {
@@ -14038,10 +14315,15 @@ describe('the fresh chat the app opened', () => {
         }),
         ack: () => ({ ok: true })
       },
-      (document) => {
+      (document, dom) => {
         document.querySelector('#prompt-textarea')!.textContent = 'a draft the user was writing';
         document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends++;
           document.querySelector('#prompt-textarea')!.textContent = '';
+          if (received) {
+            dom.reconfigure({ url: 'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555' });
+            userTurn(document, 'accepted-worker', 'You are worker agent "worker-1".', { sent: false });
+          }
         });
       }
     );
@@ -14056,7 +14338,8 @@ describe('the fresh chat the app opened', () => {
     // is stale page state rather than user work in an existing conversation. A second startup
     // tick remains a no-op: replacing the draft is permission for one bootstrap, never two.
     const acks = live.sent.filter((message) => message.type === 'ack');
-    expect(acks.map((ack) => ack.status)).toEqual(['sent']);
+    expect(sends).toBe(1);
+    expect(acks.map((ack) => ack.status)).toEqual(received ? ['sent'] : []);
     expect(live.sent.filter((message) => message.type === 'redeem')).toHaveLength(1);
   });
 });
@@ -14235,6 +14518,173 @@ describe('the context meter and automatic compaction', () => {
     };
   }
 
+  /** Keep a native frame available while the compaction barrier polls it. */
+  function compactionFiber(section: HTMLElement, calls: () => unknown[] | null,
+    siblings: () => Array<{ section: HTMLElement; calls: unknown[] }> = () => [],
+    requests: () => unknown[] = () => [], codeModeCalls: () => unknown[] = () => []) {
+    const window = live!.window as any;
+    const instant = window.setTimeout;
+    window.setTimeout = (fn: () => void, ms: number) => ms === 1500
+      ? globalThis.setTimeout(fn, ms) : instant(fn, ms);
+    const post = window.postMessage.bind(window);
+    window.postMessage = (message: any, origin: string) => {
+      if (message?.source !== 'clf-fiber-ask') return post(message, origin);
+      void Promise.resolve().then(() => {
+        const currentCalls = calls();
+        const scanToken = message.nonce;
+        const bindings = currentCalls === null ? [] : [{ section, calls: currentCalls }, ...siblings()];
+        const turns = bindings.map((binding, index) => {
+          binding.section.setAttribute('data-clf-fiber-turn', `${scanToken}:${index}`);
+          return { index, turnId: binding.section.getAttribute('data-turn-id'),
+            conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+            calls: binding.calls, codeModeCalls: codeModeCalls(), requests: index === 0 ? requests() : [], messages: [], activities: [] };
+        });
+        window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
+          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 21,
+          scanOk: currentCalls !== null, rows: [], turns
+        } }));
+      });
+    };
+  }
+
+  const compactionCall = (answered: boolean) => ({
+    messageId: 'native-result-in-flight', requestId: 'wfr-native-result-in-flight',
+    tool: 'exec', order: 0, answered
+  });
+
+  it.each([false, true])('waits for native receipt before stopping an automatic source even when local tools are finished (pre-row: %s)', async preRow => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'receipt-source', []);
+    let received = false;
+    compactionFiber(section, () => preRow && !received ? [] : [compactionCall(received)], () => [],
+      () => preRow ? [{ requestId: compactionCall(false).requestId, messageId: 'pre-row-request' }] : []);
+    const stop = live.document.querySelector('[data-testid="stop-button"]')!;
+    const stopped = vi.fn(() => stopGenerating(live!.document));
+    stop.addEventListener('click', stopped);
+    const sends = watchSend(live.document);
+
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+    expect(startedCompactions(live)).toEqual([]);
+    expect(sends()).toBe(0);
+
+    received = true;
+    await compacting;
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(startedCompactions(live)).toHaveLength(1);
+    expect(sends()).toBe(1);
+  });
+
+  it.each(['distinct-pre-row', 'same-request-running', 'same-request-code-pending'])('waits for another outstanding call beside an answered native call (%s)', async mode => {
+    let received = false;
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), {
+        pendingTools: mode === 'same-request-running' && !received ? 1 : 0
+      }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'mixed-receipt-source', []);
+    const prior = { ...compactionCall(true), messageId: 'already-received-call',
+      requestId: mode.startsWith('same-request') ? compactionCall(true).requestId : 'wfr-prior-request' };
+    compactionFiber(section, () => [prior, ...(received ? [compactionCall(true)] : [])], () => [],
+      () => [{ requestId: compactionCall(false).requestId, messageId: 'pre-row-request' }],
+      () => mode === 'same-request-code-pending'
+        ? [{ messageId: 'native-code-parent', requestId: prior.requestId, answered: received }] : []);
+    const stopped = vi.fn(() => stopGenerating(live!.document));
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const sends = watchSend(live.document);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+    expect(sends()).toBe(0);
+    received = true;
+    await compacting;
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(sends()).toBe(1);
+  });
+
+  it.each(['unanswered', 'missing', 'vanished', 'different-tool', 'different-request', 'duplicate', 'shared-request'])('keeps an automatic ticket unsent when native receipt is %s', async failure => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'receipt-source', []);
+    let changed = false;
+    compactionFiber(section, () => {
+      if (failure === 'missing') return null;
+      if (failure === 'vanished' && changed) return [{ ...compactionCall(true), messageId: 'different-answered-call' }];
+      if (failure === 'different-tool' && changed) return [{ ...compactionCall(true), tool: 'read' }];
+      if (failure === 'different-request' && changed) return [{ ...compactionCall(true), requestId: 'wfr-other-request' }];
+      if (failure === 'duplicate' && changed) return [compactionCall(true), compactionCall(true)];
+      if (failure === 'shared-request') return [compactionCall(false), { ...compactionCall(true), messageId: 'different-answered-call' }];
+      return [compactionCall(false)];
+    });
+    const stopped = vi.fn();
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+    changed = true;
+    await compacting;
+    expect(stopped).not.toHaveBeenCalled();
+    expect(startedCompactions(live)).toEqual([]);
+    expect(live.sent.some(message => message.type === 'compact' && (message.sourceDispatch || message.sourceLost))).toBe(false);
+  });
+
+  it('does not stop a newer question while an automatic source waits for native receipt', async () => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'receipt-source', []);
+    compactionFiber(section, () => [compactionCall(false)]);
+    const stopped = vi.fn();
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    userTurn(live.document, 'new-user-question', 'Work on this newer task.');
+    await compacting;
+    expect(stopped).not.toHaveBeenCalled();
+    expect(startedCompactions(live)).toEqual([]);
+  });
+
+  it('receives the original call after the same response moves into a sibling section', async () => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const original = assistantTurn(live.document, 'original-result-section', []);
+    let received = false;
+    const siblings: Array<{ section: HTMLElement; calls: unknown[] }> = [];
+    compactionFiber(original, () => [compactionCall(received)], () => siblings);
+    const stopped = vi.fn(() => stopGenerating(live!.document));
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+
+    siblings.push({ section: assistantTurn(live.document, 'later-response-section', []),
+      calls: [{ ...compactionCall(true), messageId: 'later-answered-call' }] });
+    received = true;
+    live.hook.observe();
+    await compacting;
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(startedCompactions(live)).toHaveLength(1);
+  });
+
   it.each(['dispatched-unresolved', 'sent'])('does not stop a handoff when a stale pickup reaches a fresh %s ticket', async state => {
     let releaseTicket!: (value: unknown) => void;
     const ticket = new Promise(resolve => { releaseTicket = resolve; });
@@ -14332,6 +14782,7 @@ describe('the context meter and automatic compaction', () => {
     });
     live.hook.injectControl();
     startGenerating(live.document);
+    compactionFiber(assistantTurn(live.document, 'automatic-source', []), () => [compactionCall(true)]);
     filed = true;
     const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
     let stopped = false;
@@ -14399,6 +14850,7 @@ describe('the context meter and automatic compaction', () => {
     });
     live.hook.injectControl();
     startGenerating(live.document);
+    compactionFiber(assistantTurn(live.document, 'running-tool-source', []), () => [compactionCall(true)]);
     filed = true;
     const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
     stop.addEventListener('click', () => stopGenerating(live!.document));
@@ -14852,7 +15304,7 @@ describe('one live isolated-world recorder per document', () => {
 
     await expect(live.runtimeMessage({ type: 'clf-recorder-ping' })).resolves.toEqual({
       ok: true,
-      recorderVersion: 13
+      recorderVersion: 21
     });
   });
 
@@ -15202,7 +15654,7 @@ describe('the goal loop', () => {
       const nonce = event.data.nonce;
       live!.document.querySelector('[data-turn-id="finished-answer"]')!.setAttribute('data-clf-fiber-turn', `${nonce}:0`);
       win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 12, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 21, scanOk: true, rows: [], turns: [{
           index: 0, conversationId: CHAT, turnId: 'finished-answer', endMessageId: 'finished-final', calls: [], activities: [],
           messages: [{ messageId: 'finished-final', rawMessageId: 'finished-final', stable: true, rawText: 'Completed answer.' }]
         }]
@@ -17289,7 +17741,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 12,
+            v: 21,
             scanOk: true,
             rows: [],
             turns: [{
@@ -17372,7 +17824,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 12,
+            v: 21,
             scanOk: true,
             rows: [],
             turns: [{
@@ -17530,9 +17982,7 @@ describe('the goal loop', () => {
     await settle();
     prose(live.document, section, 'a-stopped', 'half an answer, and then');
 
-    live.document
-      .querySelector('[data-testid="stop-button"]')!
-      .dispatchEvent(new live.window.MouseEvent('click', { bubbles: true }));
+    live.trustedClick(live.document.querySelector('[data-testid="stop-button"]')!);
     stopGenerating(live.document);
     live.hook.observe();
     await settle(800);
@@ -18502,6 +18952,39 @@ describe('app Stop command uses current native turn proof', () => {
     expect(h.clicks()).toBe(1);
   });
 
+  it('does not confirm a Stop command while the native page continues generating', async () => {
+    const h = await setup();
+    expect(await live!.runtimeMessage(h.request)).toEqual({ ok: true });
+    await live!.hook.flush();
+    expect(h.clicks()).toBe(1);
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(60_000);
+    live!.hook.observe(); await settle(); await live!.hook.flush();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+  });
+
+  it.each(['fresh', 'before-stop', 'foreign-turn', 'unattributed', 'finish', 'final'] as const)(
+    'rechecks the stopped page against exact subsequent MCP work (%s)', async evidence => {
+    const h = await setup();
+    const stoppedAt = live!.window.Date.now();
+    expect(await live!.runtimeMessage(h.request)).toEqual({ ok: true });
+    expect(await live!.runtimeMessage({ type: 'clf-repair-check', conversationId: h.request.conversationId }))
+      .toMatchObject({ safe: false });
+    live!.advance(1000);
+    live!.reply.set('activity', () => ({ ok: true, data: { entries: [], nextSince: 101,
+      activeTurnId: evidence === 'final' ? null : h.request.turnId,
+      pendingTools: 0, stream: [{ seq: 100, callId: 'continued-after-stop', kind: 'tool_call',
+        turnId: evidence === 'foreign-turn' ? 'another-turn' : h.request.turnId,
+        time: evidence === 'before-stop' ? stoppedAt - 1 : live!.window.Date.now(),
+        requestId: 'wfr_same_stopped_request', attribution: evidence === 'unattributed' ? 'unattributed' : 'request_id',
+        tool: evidence === 'finish' ? 'session_finish' : 'read', outcome: 'ok' }] } }));
+    await live!.hook.pullActivity();
+    expect(await live!.runtimeMessage({ type: 'clf-repair-check', conversationId: h.request.conversationId }))
+      .toMatchObject({ safe: evidence === 'fresh' });
+    expect(h.clicks()).toBe(1);
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+  });
+
   it('captures a completed final hydrated later in a hidden tab after the settle window', async () => {
     live = await harness();
     startGenerating(live.document);
@@ -18522,7 +19005,7 @@ describe('app Stop command uses current native turn proof', () => {
       if (event.data?.source !== 'clf-fiber-ask') return;
       section.setAttribute('data-clf-fiber-turn', `${event.data.nonce}:0`);
       window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 12, scanOk: true, rows: [],
+        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 21, scanOk: true, rows: [],
         turns: [{ ...terminal, index: 0, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', messages: [{
           messageId: 'late-final-message', stable: true, rawText: 'First words and the complete final answer.', renderedHtml: '<p>First words and the complete final answer.</p>'
         }] }]
@@ -18561,7 +19044,7 @@ describe('app Stop command uses current native turn proof', () => {
       }
       section.setAttribute('data-clf-fiber-turn', `${event.data.nonce}:0`);
       window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 12, scanOk: true, rows: [],
+        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 21, scanOk: true, rows: [],
         turns: [{ ...terminal, index: 0, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', endMessageId: next === 'retry' ? null : terminal.endMessageId }]
       } }));
     };
@@ -18710,6 +19193,65 @@ describe('ordinary Continue native recovery', () => {
   const chat = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
   const id = '11111111-2222-4333-8444-555555555555';
   const text = 'Continue until fully finished. Tur Tur Sahur.';
+  it.each(['reader-only', 'paired'] as const)('recovers a Continue blocked by a cached recorder protocol (%s repair)', async repair => {
+    live = await harness(`https://chatgpt.com/c/${chat}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail
+        ? { ok: true } : { input: { id, owner: 'input-owner', text, model: null, reasoningEffort: null,
+          recovery: { questionId: 'm-source', phase: 'ready' }, silenceBoundary: { turnId: 'source-turn' } } } })
+    });
+    const win = live.window as any;
+    // Chrome's static content cache can precede the helper read from disk by repair.
+    win.__CLF_CONTENT_RECORDER__.stop();
+    win.CLF_TEST_HOOK = (api: Hook) => { live!.hook = api; };
+    win.eval(contentSource.replace('const RECORDER_VERSION = 21;', 'const RECORDER_VERSION = 13;')
+      .replace('const FIBER_VERSION = 21;', 'const FIBER_VERSION = 12;'));
+    await settle();
+    userTurn(live.document, 'source', 'Complete the task');
+    const section = assistantTurn(live.document, 'native-answer', []);
+    live.hook.observe(); await settle();
+    const timed = win.setTimeout;
+    win.setTimeout = (fn: () => void, ms: number) => ms === 1500
+      ? globalThis.setTimeout(fn, 10) : timed(fn, ms);
+    const post = win.postMessage.bind(win);
+    win.postMessage = (data: any, origin: string) => {
+      if (data?.source !== 'clf-fiber-ask') return post(data, origin);
+      // Keep the asynchronous MAIN/isolated boundary without the harness's instant timeout.
+      queueMicrotask(() => {
+        section.setAttribute('data-clf-fiber-turn', `${data.nonce}:0`);
+        win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
+          source: 'clf-fiber-reply', nonce: data.nonce, scanToken: data.nonce, v: 21, scanOk: true, rows: [], turns: [{
+            index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: null,
+            calls: [], messages: [{ role: 'assistant', messageId: 'native-progress', rawMessageId: 'native-progress',
+              stable: true, rawText: 'Inspecting the task.' }]
+          }]
+        } }));
+      });
+    };
+    live.reply.set('repair_fiber', () => {
+      if (repair === 'paired') { win.eval(domSource); win.eval(contentSource); }
+      return { ok: true };
+    });
+    const send = vi.fn(() => {
+      userTurn(live!.document, 'continued', text);
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+      live!.hook.observe();
+    });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', send);
+    const offer = { type: 'clf-desktop-input', id, conversationId: chat, silenceTurnId: 'source-turn',
+      recovery: { questionId: 'm-source', stop: false } };
+    live.advance(5001);
+    await live.runtimeMessage(offer);
+    await settle();
+    expect(send).not.toHaveBeenCalled();
+    expect(live.sent.filter(message => message.type === 'repair_fiber').length).toBeGreaterThan(0);
+    // The existing maintenance offers the same durable input to the repaired recorder.
+    const recovered = await live.runtimeMessage(offer);
+    expect(send, JSON.stringify({ recovered, version: win.__CLF_CONTENT_RECORDER__.version,
+      requests: live.sent.filter(message => ['desktop_input', 'repair_fiber'].includes(message.type)) }))
+      .toHaveBeenCalledTimes(repair === 'paired' ? 1 : 0);
+    expect(live.sent.filter(message => message.ack)).toHaveLength(repair === 'paired' ? 1 : 0);
+    expect(live.listenerCounts()).toEqual({ runtime: 1, storage: 1 });
+  });
   it.each(['idle', 'busy', 'authorization', 'image-only'] as const)('rejects Continue when a native final has not reached the app yet (%s)', async scenario => {
     let terminal = scenario !== 'authorization';
     const progress = { role: 'assistant', messageId: 'native-progress', rawMessageId: 'native-progress',
@@ -18736,7 +19278,7 @@ describe('ordinary Continue native recovery', () => {
       const nonce = event.data.nonce;
       section.setAttribute('data-clf-fiber-turn', `${nonce}:0`);
       win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 12, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 21, scanOk: true, rows: [], turns: [{
           index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: terminal ? 'native-terminal' : null,
           calls: [], activities: [], messages: terminal ? [{ role: 'assistant', messageId: 'native-terminal',
             rawMessageId: 'native-terminal', stable: true, rawText: scenario === 'image-only' ? '' : 'Finished the task.' }] : [progress]
@@ -18762,19 +19304,21 @@ describe('ordinary Continue native recovery', () => {
     expect(emitted(live.sent, 'assistant_message')).toContainEqual(expect.objectContaining({ event: expect.objectContaining({
       providerMessageId: 'native-terminal', final: true
     }) }));
+    expect(live.sent.filter(message => message.type === 'desktop_input' && message.fail)).toEqual(scenario === 'authorization'
+      ? [expect.objectContaining({ id, owner: 'input-owner', error: 'After-turn pickup was withdrawn before Send.' })] : []);
   });
-  it('journals native Stop immediately even while the native Stop control remains mounted', async () => {
+  it('blocks automatic repair on trusted Stop intent without inventing a terminal observation', async () => {
     live = await harness(`https://chatgpt.com/c/${chat}`);
     userTurn(live.document, 'source', 'Complete the task'); startGenerating(live.document, { send: false });
     live.hook.observe(); await settle();
     const button = live.document.querySelector('[data-testid="stop-button"]') as HTMLElement;
     Object.defineProperty(button, 'getClientRects', { value: () => [{ width: 10, height: 10 }] });
-    button.click(); await live.hook.flush();
+    live.trustedClick(button); await live.hook.flush();
     expect(live.document.contains(button)).toBe(true);
-    expect(emitted(live.sent, 'turn_end').filter(row => row.event.outcome === 'stopped')).toHaveLength(1);
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
     expect(await live.runtimeMessage({ type: 'clf-repair-check', conversationId: chat })).toMatchObject({ safe: false });
-    button.click(); await live.hook.flush();
-    expect(emitted(live.sent, 'turn_end').filter(row => row.event.outcome === 'stopped')).toHaveLength(1);
+    live.trustedClick(button); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
   });
 
   it.each(['stop', 'send'] as const)('does not execute a stale %s permission after new native work', async during => {

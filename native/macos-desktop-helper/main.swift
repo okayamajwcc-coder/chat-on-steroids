@@ -215,6 +215,11 @@ private func allWindowRows(includeMinimized: Bool = true) -> [WindowRow] {
     guard let raw = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID)
         as? [JSONObject] else { return [] }
     let ownPid = getpid()
+    // A visible-looking off-Space window can have no kCGWindowIsOnscreen key.
+    // Only the authoritative on-screen list may restore an omitted flag.
+    let onScreenIDs = Set((CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+    ) as? [JSONObject] ?? []).compactMap { number($0[kCGWindowNumber as String])?.uint32Value })
     let rows: [WindowRow] = raw.compactMap { item -> WindowRow? in
         guard
             let id = number(item[kCGWindowNumber as String])?.uint32Value,
@@ -226,11 +231,17 @@ private func allWindowRows(includeMinimized: Bool = true) -> [WindowRow] {
             bounds.height > 1
         else { return nil }
         let layer = int(item[kCGWindowLayer as String])
-        let onScreen = bool(item[kCGWindowIsOnscreen as String])
+        let reportedOnScreen = number(item[kCGWindowIsOnscreen as String])?.boolValue
         let alpha = number(item[kCGWindowAlpha as String])?.doubleValue ?? 1
         guard layer == 0, alpha > 0 else { return nil }
         let process = string(item[kCGWindowOwnerName as String], default: "Process \(pid)")
         let title = string(item[kCGWindowName as String]).trimmingCharacters(in: .whitespacesAndNewlines)
+        // macOS 15 can omit kCGWindowIsOnscreen for a real visible Chromium top-level window.
+        // Recover only a titled, substantial, display-intersecting row. Explicit false stays
+        // off-screen and continues through the AX minimised/hidden recovery path below.
+        let displayIntersection = (try? activeDisplayRects())?.contains { !$0.intersection(bounds).isNull && $0.intersection(bounds).width >= 160 && $0.intersection(bounds).height >= 120 } ?? false
+        let missingOnScreenFallback = reportedOnScreen == nil && onScreenIDs.contains(id) && !title.isEmpty && bounds.width >= 320 && bounds.height >= 240 && displayIntersection
+        let onScreen = reportedOnScreen ?? missingOnScreenFallback
         let displayTitle = title.isEmpty ? "\(process) window" : title
         return WindowRow(
             id: id,
@@ -430,6 +441,11 @@ private func unambiguousWindowID(bounds: CGRect, pid: pid_t, rows: [WindowRow]) 
         .map { (id: $0.id, distance: windowGeometryDistance(bounds, $0.bounds)) }
         .sorted { $0.distance < $1.distance }
     guard let winner = candidates.first else { return nil }
+    // Exact geometry is stronger than a nearby overlapping window. Accept it only
+    // when exactly one PID-matched WindowServer row has the same four edges.
+    let exact = rows.filter { $0.pid == pid && approximatelyEqual(bounds, $0.bounds) }
+    if exact.count == 1 { return exact[0].id }
+    if exact.count > 1 { return nil }
     if candidates.count > 1, candidates[1].distance - winner.distance < 32 { return nil }
     return winner.id
 }
@@ -483,15 +499,36 @@ private func windowServerTopWindowID(at point: CGPoint) -> CGWindowID? {
         [.optionOnScreenOnly, .excludeDesktopElements],
         kCGNullWindowID
     ) as? [JSONObject] else { return nil }
+    let displayRects = (try? activeDisplayRects()) ?? []
     for item in ordered {
         guard let id = number(item[kCGWindowNumber as String])?.uint32Value,
               let boundsDictionary = item[kCGWindowBounds as String] as? NSDictionary,
               let bounds = CGRect(dictionaryRepresentation: boundsDictionary),
               bounds.contains(point),
               (number(item[kCGWindowAlpha as String])?.doubleValue ?? 1) > 0 else { continue }
+        // Dock publishes a full-display, non-interactive compositor backdrop at layer 20.
+        // Exclude only that exact surface; actual Dock menus and other overlays remain blockers.
+        let layer = int(item[kCGWindowLayer as String])
+        let owner = string(item[kCGWindowOwnerName as String])
+        let name = string(item[kCGWindowName as String])
+        let dockBackdrop = layer == 20 && owner == "Dock" && name == "Dock" &&
+            displayRects.contains { approximatelyEqual($0, bounds) }
+        if dockBackdrop { continue }
+        // The first real window at the coordinate wins, including nonzero-layer floating
+        // panels and popups. Restricting to allWindowRows(layer == 0) clicks through them.
         return id
     }
     return nil
+}
+
+// Focus ownership is not z-order ownership. Chromium may place a same-process transient
+// popup (for example Translate) above the requested main window while AX still proves that
+// the requested window owns focus. Do not treat that popup as a failed focus. Pointer and
+// keyboard delivery retain their stricter WindowServer checks below.
+private func focusTargetMatches(_ row: WindowRow) -> Bool {
+    guard frontmostPID() == row.pid else { return false }
+    let rows = allWindowRows(includeMinimized: false)
+    return focusedAXWindowID(for: row.pid, rows: rows) == row.id
 }
 
 // Pointer delivery is spatial. Prove the exact active window without requiring the
@@ -508,12 +545,16 @@ private func pointerTargetMatches(_ row: WindowRow, point: CGPoint? = nil) -> Bo
     return true
 }
 
-// Keyboard delivery is not spatial. Keep the stronger focused-control ownership proof.
+// Keyboard delivery is not spatial. A same-process transient Chromium popup may be
+// WindowServer-front without owning keyboard focus. Prove process, focused AX window and
+// focused AX control ownership directly; pointer delivery keeps its z-order proof above.
 private func inputTargetMatches(_ row: WindowRow) -> Bool {
-    guard pointerTargetMatches(row) else { return false }
+    // Keyboard events are posted to the target PID, so exact input ownership is the
+    // frontmost process plus its focused AX window. Chromium may publish no focused UI
+    // element (or move it transiently) even while that exact window retains keyboard focus.
+    guard frontmostPID() == row.pid else { return false }
     let rows = allWindowRows(includeMinimized: false)
-    guard focusedAXElementWindowID(for: row.pid, rows: rows) == row.id else { return false }
-    return true
+    return focusedAXWindowID(for: row.pid, rows: rows) == row.id
 }
 
 private func assertPointerTarget(_ id: CGWindowID, point: CGPoint? = nil) throws -> WindowRow {
@@ -585,6 +626,7 @@ private func matchingAXWindow(_ row: WindowRow, deadline suppliedDeadline: TimeI
         guard ProcessInfo.processInfo.systemUptime < deadline else {
             throw fail("UIA_TIMEOUT", "accessibility window matching exceeded its bounded native deadline")
         }
+        // Geometry may fill absent identity, but must never override a contradictory AX ID.
         guard axWindowNumber(window) == nil, let bounds = axBounds(window), convincinglyMatchesWindow(bounds, row.bounds) else { continue }
         geometryCandidates.append((window, windowGeometryDistance(bounds, row.bounds)))
     }
@@ -592,7 +634,11 @@ private func matchingAXWindow(_ row: WindowRow, deadline suppliedDeadline: TimeI
     guard let winner = geometryCandidates.first else {
         throw fail("UIA_FAILED", "no accessibility window convincingly matches window \(row.id)")
     }
-    if geometryCandidates.count > 1, geometryCandidates[1].distance - winner.distance < 32 {
+    // Chromium windows may overlap with a small cascade offset. A unique
+    // four-edge match identifies the target without weakening ambiguous cases.
+    let exact = geometryCandidates.filter { approximatelyEqual(axBounds($0.element) ?? .null, row.bounds) }
+    if exact.count == 1 { return exact[0].element }
+    if exact.count > 1 || (geometryCandidates.count > 1 && geometryCandidates[1].distance - winner.distance < 32) {
         throw fail("UIA_FAILED", "multiple accessibility windows ambiguously match window \(row.id)")
     }
     return winner.element
@@ -601,7 +647,7 @@ private func matchingAXWindow(_ row: WindowRow, deadline suppliedDeadline: TimeI
 private func focusWindow(_ id: CGWindowID) throws -> Bool {
     guard let row = windowRow(id) else { return false }
     try requireAccessibility()
-    if pointerTargetMatches(row) { return true }
+    if focusTargetMatches(row) { return true }
     guard let app = NSRunningApplication(processIdentifier: row.pid) else { return false }
     let window = try matchingAXWindow(row)
     var minimizedSettable = DarwinBoolean(false)
@@ -620,7 +666,7 @@ private func focusWindow(_ id: CGWindowID) throws -> Bool {
     let deadline = ProcessInfo.processInfo.systemUptime + 2.0
     var consecutiveMatches = 0
     while ProcessInfo.processInfo.systemUptime < deadline {
-        if pointerTargetMatches(row) {
+        if focusTargetMatches(row) {
             consecutiveMatches += 1
             if consecutiveMatches >= 3 { return true }
         } else {
@@ -1008,8 +1054,16 @@ private func pressKeys(_ names: [String], targetWindow: CGWindowID? = nil) throw
             try postKey(resolved[index].code, keyDown: true, flags: flags)
             pressedModifierIndices.append(index)
         }
-        // A window transition while modifiers are down must abort before the ordinary key.
-        if let targetWindow { targetPID = try assertInputTarget(targetWindow).pid }
+        // Modifier keys may legitimately move Chromium's focused AX control (for example,
+        // Command before Command-L) without changing the owning window. Revalidate the
+        // frontmost process and focused AX window here, but do not require the transient
+        // focused control to remain identical after modifiers are down.
+        if let targetWindow {
+            guard let row = windowRow(targetWindow), row.onScreen, focusTargetMatches(row) else {
+                throw fail("INPUT_TARGET_LOST", "window \(targetWindow) lost focused-window ownership while modifiers were down; no ordinary key was sent")
+            }
+            targetPID = row.pid
+        }
         for index in ordinaryIndices {
             try postKey(resolved[index].code, keyDown: true, flags: flags.union(resolved[index].requiredFlags))
         }

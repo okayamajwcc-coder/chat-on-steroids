@@ -15,12 +15,20 @@ describe('macOS desktop safety hardening', () => {
     expect(swift).toContain('private func assertPointerTarget');
     expect(swift).toContain('private func assertInputTarget');
     expect(swift).toContain('private func assertFrameTarget');
+    expect(swift).toContain('let reportedOnScreen = number(item[kCGWindowIsOnscreen as String])?.boolValue');
+    expect(swift).toContain('let missingOnScreenFallback = reportedOnScreen == nil && onScreenIDs.contains(id) && !title.isEmpty');
+    expect(swift).toContain('let onScreen = reportedOnScreen ?? missingOnScreenFallback');
+    expect(swift).toMatch(/private func focusTargetMatches[\s\S]*frontmostPID\(\) == row\.pid[\s\S]*focusedAXWindowID\(for: row\.pid, rows: rows\) == row\.id/);
+    expect(swift).toMatch(/private func focusWindow[\s\S]*focusTargetMatches\(row\)/);
     expect(swift).toMatch(/private func pointerTargetMatches[\s\S]*frontmostPID\(\) == row\.pid/);
     expect(swift).toMatch(/private func pointerTargetMatches[\s\S]*windowServerFrontWindowID\(rows: rows\) == row\.id/);
     expect(swift).toMatch(/private func pointerTargetMatches[\s\S]*focusedAXWindowID\(for: row\.pid, rows: rows\) == row\.id/);
     expect(swift).toMatch(/private func pointerTargetMatches[\s\S]*windowServerTopWindowID\(at: point\) == row\.id/);
-    expect(swift).toMatch(/private func inputTargetMatches[\s\S]*pointerTargetMatches\(row\)/);
-    expect(swift).toMatch(/private func inputTargetMatches[\s\S]*focusedAXElementWindowID\(for: row\.pid, rows: rows\) == row\.id/);
+    expect(swift).toMatch(/private func inputTargetMatches[\s\S]*frontmostPID\(\) == row\.pid[\s\S]*focusedAXWindowID\(for: row\.pid, rows: rows\) == row\.id/);
+    const keyboardProof = swift.slice(swift.indexOf('private func inputTargetMatches'), swift.indexOf('private func assertPointerTarget'));
+    expect(keyboardProof).not.toContain('pointerTargetMatches(row)');
+    expect(keyboardProof).not.toContain('windowServerFrontWindowID');
+    expect(keyboardProof).not.toContain('focusedAXElementWindowID');
   });
 
   it('falls back to Workspace only when system-wide AX reports an invalid focused-app pid', () => {
@@ -48,6 +56,9 @@ describe('macOS desktop safety hardening', () => {
     const start = swift.indexOf('private func windowServerTopWindowID');
     const end = swift.indexOf('private func pointerTargetMatches');
     const proof = swift.slice(start, end);
+    expect(proof).not.toContain('eligible.contains(id)');
+    expect(proof).toContain('let dockBackdrop = layer == 20 && owner == "Dock" && name == "Dock"');
+    expect(proof).toContain('if dockBackdrop { continue }');
     expect(proof).not.toContain('int(item[kCGWindowLayer as String]) == 0');
     expect(proof).toContain('bounds.contains(point)');
   });
@@ -84,6 +95,9 @@ describe('macOS desktop safety hardening', () => {
     expect(swift).toContain('UCKeyTranslate');
     expect(swift).toContain('active keyboard layout does not expose logical key');
     expect(preparation).toMatch(/'-framework',\s*'Carbon'/);
+    const pressKeysProof = swift.slice(swift.indexOf('private func pressKeys'), swift.indexOf('private func typeText'));
+    expect(pressKeysProof).toContain('focusTargetMatches(row)');
+    expect(pressKeysProof).toContain('lost focused-window ownership while modifiers were down');
   });
 
   it('routes system shortcuts globally and rejects disabled semantic controls', () => {

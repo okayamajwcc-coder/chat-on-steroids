@@ -1,15 +1,18 @@
 import zhCN from './locales/zh-CN.json';
 import es from './locales/es.json';
 import zhTW from './locales/zh-TW.json';
+import ja from './locales/ja.json';
+import tr from './locales/tr.json';
+import fr from './locales/fr.json';
 
-export type Language = 'en' | 'es' | 'zh-CN' | 'zh-TW';
+export type Language = 'en' | 'es' | 'zh-CN' | 'zh-TW' | 'ja' | 'tr' | 'fr';
 const STORAGE_KEY = 'cos.ui.language';
 type Catalog = Readonly<Record<string, string>>;
-const catalogs: Readonly<Record<Exclude<Language, 'en'>, Catalog>> = { es, 'zh-CN': zhCN, 'zh-TW': zhTW };
+const catalogs: Readonly<Record<Exclude<Language, 'en'>, Catalog>> = { es, 'zh-CN': zhCN, 'zh-TW': zhTW, ja, tr, fr };
 const sourceKeys = new Set(Object.values(catalogs).flatMap(catalog => Object.keys(catalog)));
 
 function parseLanguage(value: string | null | undefined): Language {
-  return value === 'es' || value === 'zh-CN' || value === 'zh-TW' ? value : 'en';
+  return value === 'es' || value === 'zh-CN' || value === 'zh-TW' || value === 'ja' || value === 'tr' || value === 'fr' ? value : 'en';
 }
 
 let language: Language = 'en';
@@ -97,6 +100,7 @@ export function initLanguage(): void {
     if (sourceKeys.has(key)) ui(node, 'textContent', () => source.replace(/\S[\s\S]*\S|\S/, t(key)));
   }
   for (const node of document.querySelectorAll<HTMLElement>('[title], [placeholder], [aria-label]')) {
+    if (node.closest('[translate="no"]')) continue;
     for (const property of ['title', 'placeholder', 'aria-label'] as const) {
       const source = node.getAttribute(property);
       if (source && sourceKeys.has(source)) ui(node, property, () => t(source));
