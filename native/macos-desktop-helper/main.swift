@@ -277,6 +277,31 @@ private func windowRow(_ id: CGWindowID) -> WindowRow? {
     allWindowRows().first { $0.id == id }
 }
 
+// Focus recovery sometimes needs the exact WindowServer identity before AX can see the
+// window again (notably Chrome on another Space).  Keep this separate from discovery:
+// callers must opt in to a raw row, and normal window listings still require AX proof.
+private func rawWindowRow(_ id: CGWindowID) -> WindowRow? {
+    // optionAll ignores relativeToWindow only when it is kCGNullWindowID; filter the exact
+    // id ourselves.  Passing `id` here produced an empty list for a real off-Space window.
+    guard let raw = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [JSONObject],
+          let item = raw.first(where: { number($0[kCGWindowNumber as String])?.uint32Value == id }),
+          let pid = number(item[kCGWindowOwnerPID as String])?.int32Value,
+          pid != getpid(),
+          let boundsDictionary = item[kCGWindowBounds as String] as? NSDictionary,
+          let bounds = CGRect(dictionaryRepresentation: boundsDictionary),
+          bounds.width > 1, bounds.height > 1
+    else { return nil }
+    let layer = int(item[kCGWindowLayer as String])
+    let alpha = number(item[kCGWindowAlpha as String])?.doubleValue ?? 1
+    guard layer == 0, alpha > 0 else { return nil }
+    let process = string(item[kCGWindowOwnerName as String], default: "Process \(pid)")
+    let title = string(item[kCGWindowName as String]).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !title.isEmpty else { return nil }
+    let onScreenIDs = Set((CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [JSONObject] ?? []).compactMap { number($0[kCGWindowNumber as String])?.uint32Value })
+    return WindowRow(id: id, pid: pid, title: title, process: process, bounds: bounds,
+                     onScreen: onScreenIDs.contains(id), minimized: false, layer: layer)
+}
+
 private func frontmostPID() -> pid_t? {
     // For trusted assistive control, query the system-wide AX focus directly. NSWorkspace's
     // frontmostApplication is notification-backed and can be stale on a native worker or
@@ -644,10 +669,71 @@ private func matchingAXWindow(_ row: WindowRow, deadline suppliedDeadline: TimeI
     return winner.element
 }
 
+// Chrome does not expose windows from another macOS Space through AXWindows.  Apple Events
+// can still address those windows, so use this narrowly-scoped recovery only when the exact
+// WindowServer row belongs to Chrome and its title identifies exactly one Chrome window.
+// The normal AX/WindowServer proof below still has to succeed before focus is accepted.
+private func restoreChromeWindowFromAnotherSpace(_ row: WindowRow) -> Bool {
+    guard
+        !row.onScreen,
+        !row.title.isEmpty,
+        let app = NSRunningApplication(processIdentifier: row.pid),
+        app.bundleIdentifier == "com.google.Chrome"
+    else { return false }
+
+    let escapedTitle = row.title
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    let source = """
+    tell application id "com.google.Chrome"
+        set matches to every window whose title is "\(escapedTitle)"
+        if (count of matches) is not 1 then error "ambiguous Chrome window title"
+        set index of item 1 of matches to 1
+        activate
+    end tell
+    """
+    var error: NSDictionary?
+    guard NSAppleScript(source: source)?.executeAndReturnError(&error) != nil, error == nil else { return false }
+
+    let deadline = ProcessInfo.processInfo.systemUptime + 2.0
+    while ProcessInfo.processInfo.systemUptime < deadline {
+        if let current = windowRow(row.id), current.onScreen { return true }
+        usleep(20_000)
+    }
+    return false
+}
+
 private func focusWindow(_ id: CGWindowID) throws -> Bool {
-    guard let row = windowRow(id) else { return false }
+    // Only Chrome may use the raw WindowServer identity for an off-Space recovery.
+    // All other applications continue to require an AX-proven discovery row.
+    let discovered = windowRow(id)
+    let raw = discovered == nil ? rawWindowRow(id) : nil
+    let chromeRecovery = raw.flatMap { candidate -> WindowRow? in
+        guard !candidate.onScreen,
+              NSRunningApplication(processIdentifier: candidate.pid)?.bundleIdentifier == "com.google.Chrome"
+        else { return nil }
+        return candidate
+    }
+    guard let row = discovered ?? chromeRecovery else { return false }
     try requireAccessibility()
     if focusTargetMatches(row) { return true }
+    if !row.onScreen && restoreChromeWindowFromAnotherSpace(row) {
+        guard let restored = windowRow(id), restored.onScreen,
+              restored.pid == row.pid, restored.title == row.title else { return false }
+        // Recheck the exact window after Apple Events; never recursively retry recovery.
+        let deadline = ProcessInfo.processInfo.systemUptime + 2.0
+        var consecutiveMatches = 0
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if focusTargetMatches(restored) {
+                consecutiveMatches += 1
+                if consecutiveMatches >= 3 { return true }
+            } else {
+                consecutiveMatches = 0
+            }
+            usleep(20_000)
+        }
+        return false
+    }
     guard let app = NSRunningApplication(processIdentifier: row.pid) else { return false }
     let window = try matchingAXWindow(row)
     var minimizedSettable = DarwinBoolean(false)
@@ -1201,11 +1287,19 @@ private func actUI(_ request: JSONObject) throws -> JSONObject {
 private func validateFrame(_ frame: JSONObject) throws {
     guard let region = rect(frame["region"]) else { throw fail("STALE_FRAME", "the coordinate frame is malformed") }
     if let windowID = number(frame["window"])?.uint32Value {
-        // A captured window can become off-Space/hidden while remaining the exact AX-proven
-        // window. Permit activation from that state, but never physical input: focusWindow
-        // must first bring it back on-screen and assertFrameTarget then re-proves the exact
-        // WindowServer + AX pointer target before any mutation is emitted.
-        guard let row = windowRow(windowID) else {
+        // Chrome can disappear from AXWindows on another Space. Permit the same narrow
+        // raw-WindowServer recovery as focusWindow, but only for a previously captured
+        // window with unchanged geometry; no input is allowed until AX and pointer proof
+        // succeed after restoration.
+        let discovered = windowRow(windowID)
+        let raw = discovered == nil ? rawWindowRow(windowID) : nil
+        let chromeRecovery = raw.flatMap { candidate -> WindowRow? in
+            guard !candidate.onScreen,
+                  NSRunningApplication(processIdentifier: candidate.pid)?.bundleIdentifier == "com.google.Chrome"
+            else { return nil }
+            return candidate
+        }
+        guard let row = discovered ?? chromeRecovery else {
             throw fail("STALE_FRAME", "target window \(windowID) is no longer available")
         }
         let expected = rect(frame["windowGeometry"]) ?? region

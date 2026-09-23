@@ -64,9 +64,23 @@ describe('macOS desktop safety hardening', () => {
   });
 
   it('allows only AX-proven off-Space frames to activate before requiring on-screen pointer proof', () => {
-    expect(swift).toMatch(/private func validateFrame[\s\S]*guard let row = windowRow\(windowID\)[\s\S]*focusWindow\(windowID\)[\s\S]*after\.onScreen[\s\S]*assertFrameTarget\(frame\)/);
+    expect(swift).toMatch(/private func validateFrame[\s\S]*let discovered = windowRow\(windowID\)[\s\S]*guard let row = discovered \?\? chromeRecovery[\s\S]*focusWindow\(windowID\)[\s\S]*after\.onScreen[\s\S]*assertFrameTarget\(frame\)/);
     expect(swift).toMatch(/private func assertFrameTarget[\s\S]*guard let row = windowRow\(windowID\), row\.onScreen/);
     expect(swift).toMatch(/private func assertPointerTarget[\s\S]*guard let row = windowRow\(id\), row\.onScreen/);
+  });
+
+  it('keeps Chrome off-Space recovery narrow and revalidates the exact WindowServer id', () => {
+    expect(swift).toMatch(/private func rawWindowRow[\s\S]*\.optionAll, \.excludeDesktopElements\], kCGNullWindowID/);
+    expect(swift).toMatch(/private func rawWindowRow[\s\S]*raw\.first\(where: \{ number\(\$0\[kCGWindowNumber as String\]\)\?\.uint32Value == id \}\)/);
+    expect(swift).toMatch(/private func focusWindow[\s\S]*let discovered = windowRow\(id\)[\s\S]*let raw = discovered == nil \? rawWindowRow\(id\) : nil/);
+    expect(swift).toMatch(/let chromeRecovery = raw\.flatMap[\s\S]*!candidate\.onScreen[\s\S]*bundleIdentifier == "com\.google\.Chrome"/);
+    expect(swift).toMatch(/guard let row = discovered \?\? chromeRecovery else \{ return false \}/);
+    expect(swift).toMatch(/restoreChromeWindowFromAnotherSpace[\s\S]*bundleIdentifier == "com\.google\.Chrome"/);
+    expect(swift).toContain('if (count of matches) is not 1 then error "ambiguous Chrome window title"');
+    expect(swift).toMatch(/restoreChromeWindowFromAnotherSpace[\s\S]*windowRow\(row\.id\)[\s\S]*current\.onScreen/);
+    expect(swift).toMatch(/private func focusWindow[\s\S]*!row\.onScreen && restoreChromeWindowFromAnotherSpace\(row\)/);
+    expect(swift).toMatch(/restored\.pid == row\.pid, restored\.title == row\.title/);
+    expect(swift).toMatch(/if !row\.onScreen && restoreChromeWindowFromAnotherSpace[\s\S]*consecutiveMatches >= 3/);
   });
 
   it('revalidates a window-bound frame at every physical mutation boundary', () => {
